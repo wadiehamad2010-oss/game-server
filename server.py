@@ -94,7 +94,7 @@ async def find_match(player_id, websocket, score_range):
 			if p["id"] not in [player_id, other["id"]]
 		]
 
-		# اللاعب الأول index=0، الثاني index=1
+		# نرسل match_found لكلا اللاعبين
 		await websocket.send(json.dumps({
 			"type": "match_found",
 			"player_id": player_id,
@@ -109,6 +109,10 @@ async def find_match(player_id, websocket, score_range):
 			"room_id": room_id
 		}))
 
+		# ننتظر ثانية عشان اللاعبين يدخلون Game أولاً
+		await asyncio.sleep(1)
+
+		# نرسل player_joined لكلا اللاعبين
 		await websocket.send(json.dumps({
 			"type": "player_joined",
 			"player_id": other["id"]
