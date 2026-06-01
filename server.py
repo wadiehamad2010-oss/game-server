@@ -5,12 +5,15 @@ import uuid
 
 waiting_players = {}
 active_rooms = {}
+# ربط كل لاعب بغرفته (يحل مشكلة room_id للاعب الأول)
+player_rooms = {}
+# تتبع من أرسل game_ready داخل كل غرفة
+room_ready = {}
 
 # ======================================
 async def handle(websocket):
 	player_id = str(uuid.uuid4())[:8]
 	player_score = 0
-	room_id = None
 
 	print(f"✅ لاعب دخل - ID: {player_id}")
 
@@ -31,25 +34,49 @@ async def handle(websocket):
 					"score": player_score
 				})
 
-				room_id = await find_match(
-					player_id, websocket, score_range
-				)
+				await find_match(player_id, websocket, score_range)
+
+			elif data["type"] == "game_ready":
+				room_id = player_rooms.get(player_id)
+				if not room_id or room_id not in active_rooms:
+					continue
+
+				ready = room_ready.setdefault(room_id, set())
+				ready.add(player_id)
+				print(f"📥 game_ready من {player_id} — الغرفة {room_id}: {len(ready)}/2")
+
+				if len(ready) >= len(active_rooms[room_id]):
+					await _send_player_joined(room_id)
 
 			elif data["type"] == "position_update":
-				if room_id and room_id in active_rooms:
-					room = active_rooms[room_id]
-					for pid, pws in room.items():
-						if pid != player_id:
-							try:
-								await pws.send(json.dumps({
-									"type": "position_update",
-									"x": data["x"],
-									"y": data["y"],
-									"z": data["z"],
-									"ry": data["ry"]
-								}))
-							except:
-								pass
+				# الاعتماد على player_rooms فقط (وليس متغير room_id المحلي في handle)
+				room_id = player_rooms.get(player_id)
+				# مزامنة: اللاعب المنتظر أولاً قد يكون داخل الغرفة دون تسجيل في player_rooms
+				if not room_id:
+					for rid, room in active_rooms.items():
+						if player_id in room:
+							room_id = rid
+							player_rooms[player_id] = rid
+							break
+				if not room_id:
+					continue
+				room = active_rooms.get(room_id)
+				if not room or player_id not in room:
+					continue
+				payload = json.dumps({
+					"type": "position_update",
+					"x": data["x"],
+					"y": data["y"],
+					"z": data["z"],
+					"ry": data["ry"]
+				})
+				for pid, pws in room.items():
+					if pid == player_id:
+						continue
+					try:
+						await pws.send(payload)
+					except Exception:
+						pass
 
 			elif data["type"] == "cancel_match":
 				_remove_from_waiting(player_id)
@@ -58,6 +85,7 @@ async def handle(websocket):
 		pass
 	finally:
 		_remove_from_waiting(player_id)
+		room_id = player_rooms.get(player_id)
 		if room_id and room_id in active_rooms:
 			room = active_rooms[room_id]
 			for pid, pws in room.items():
@@ -69,8 +97,35 @@ async def handle(websocket):
 						}))
 					except:
 						pass
-			del active_rooms[room_id]
+			_cleanup_room(room_id)
 		print(f"❌ لاعب خرج - ID: {player_id}")
+
+# ======================================
+async def _send_player_joined(room_id):
+	room = active_rooms.get(room_id)
+	if not room or len(room) < 2:
+		return
+
+	player_ids = list(room.keys())
+	for pid in player_ids:
+		other_pid = player_ids[1] if player_ids[0] == pid else player_ids[0]
+		try:
+			await room[pid].send(json.dumps({
+				"type": "player_joined",
+				"player_id": other_pid
+			}))
+		except:
+			pass
+
+	print(f"✅ أرسلنا player_joined للغرفة {room_id}")
+
+# ======================================
+def _cleanup_room(room_id):
+	if room_id in active_rooms:
+		for pid in active_rooms[room_id]:
+			player_rooms.pop(pid, None)
+		del active_rooms[room_id]
+	room_ready.pop(room_id, None)
 
 # ======================================
 async def find_match(player_id, websocket, score_range):
@@ -89,12 +144,16 @@ async def find_match(player_id, websocket, score_range):
 			other["id"]: other["socket"]
 		}
 
+		# ربط كلا اللاعبين بالغرفة (إصلاح room_id للاعب الأول)
+		for pid in active_rooms[room_id]:
+			player_rooms[pid] = room_id
+		room_ready[room_id] = set()
+
 		waiting_players[score_range] = [
 			p for p in players
 			if p["id"] not in [player_id, other["id"]]
 		]
 
-		# نرسل match_found لكلا اللاعبين
 		await websocket.send(json.dumps({
 			"type": "match_found",
 			"player_id": player_id,
@@ -109,29 +168,13 @@ async def find_match(player_id, websocket, score_range):
 			"room_id": room_id
 		}))
 
-		# ننتظر ثانية عشان اللاعبين يدخلون Game أولاً
-		await asyncio.sleep(1)
-
-		# نرسل player_joined لكلا اللاعبين
-		await websocket.send(json.dumps({
-			"type": "player_joined",
-			"player_id": other["id"]
-		}))
-
-		await other["socket"].send(json.dumps({
-			"type": "player_joined",
-			"player_id": player_id
-		}))
-
-		print(f"✅ غرفة جديدة: {room_id}")
-		return room_id
+		print(f"✅ غرفة جديدة: {room_id} — بانتظار game_ready من اللاعبين")
 	else:
 		total = sum(len(v) for v in waiting_players.values())
 		await websocket.send(json.dumps({
 			"type": "waiting",
 			"count": total
 		}))
-		return None
 
 # ======================================
 def _remove_from_waiting(player_id):
